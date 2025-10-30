@@ -255,7 +255,7 @@ using socklen_t = int;
 #include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#ifdef __linux__
+#if defined __linux__ || defined __EMSCRIPTEN__
 #include <resolv.h>
 #endif
 #include <csignal>
@@ -305,6 +305,12 @@ using socket_t = int;
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#include <emscripten/posix_socket.h>
+#include <emscripten/websocket.h>
+#endif
 
 #if defined(CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO) ||                        \
     defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN)
@@ -2390,6 +2396,10 @@ make_basic_authentication_header(const std::string &username,
                                  const std::string &password,
                                  bool is_proxy = false);
 
+#ifdef __EMSCRIPTEN__
+void emscripten_init_websocket(const std::string &websocket_server_bridge);
+#endif
+
 namespace detail {
 
 #if defined(_WIN32)
@@ -3189,17 +3199,32 @@ inline void mmap::close() {
   }
 
   if (fd_ != -1) {
+#ifndef __EMSCRIPTEN__
+    ::shutdown(fd_, SHUT_RDWR);
+#else
     ::close(fd_);
+#endif
     fd_ = -1;
   }
 #endif
   size_ = 0;
 }
+
 inline int close_socket(socket_t sock) {
 #ifdef _WIN32
   return closesocket(sock);
+#elif defined(__EMSCRIPTEN__)
+  return shutdown(sock, SHUT_RDWR);
 #else
   return close(sock);
+#endif
+}
+
+inline void sleep_for(const std::chrono::microseconds &ms) {
+#ifdef __EMSCRIPTEN__
+  emscripten_thread_sleep(ms.count());
+#else
+  std::this_thread::sleep_for(ms);
 #endif
 }
 
@@ -3208,7 +3233,7 @@ template <typename T> inline ssize_t handle_EINTR(T fn) {
   while (true) {
     res = fn();
     if (res < 0 && errno == EINTR) {
-      std::this_thread::sleep_for(std::chrono::microseconds{1});
+      sleep_for(std::chrono::microseconds{1});
       continue;
     }
     break;
@@ -3241,9 +3266,31 @@ inline ssize_t send_socket(socket_t sock, const void *ptr, size_t size,
   });
 }
 
+#ifdef __EMSCRIPTEN__
+static EMSCRIPTEN_WEBSOCKET_T bridge_socket = 0;
+inline int emscripten_poll(struct pollfd *, nfds_t, int timeout) {
+  uint64_t start_time = emscripten_get_now();
+  uint16_t ready_state = 0;
+  do {
+    emscripten_websocket_get_ready_state(bridge_socket, &ready_state);
+
+    if (timeout >= 0) {
+      uint64_t now = emscripten_get_now();
+      double elapsed_ms = (now - start_time);
+      if (elapsed_ms >= timeout) { return 0; }
+    }
+
+    emscripten_thread_sleep(100);
+  } while (ready_state == 0);
+  return ready_state;
+}
+#endif
+
 inline int poll_wrapper(struct pollfd *fds, nfds_t nfds, int timeout) {
 #ifdef _WIN32
   return ::WSAPoll(fds, nfds, timeout);
+#elif defined(__EMSCRIPTEN__)
+  return emscripten_poll(fds, nfds, timeout);
 #else
   return ::poll(fds, nfds, timeout);
 #endif
@@ -3880,6 +3927,10 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
     hints.ai_flags = socket_flags;
   }
 
+#ifdef __EMSCRIPTEN__
+  hints.ai_flags |= AI_CANONNAME;
+#endif
+
 #if !defined(_WIN32) || defined(CPPHTTPLIB_HAVE_AFUNIX_H)
   if (hints.ai_family == AF_UNIX) {
     const auto addrlen = host.length();
@@ -3931,7 +3982,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 
   if (getaddrinfo_with_timeout(node, service.c_str(), &hints, &result,
                                timeout_sec)) {
-#if defined __linux__ && !defined __ANDROID__
+#if (defined __linux__ || defined __EMSCRIPTEN__) && !defined __ANDROID__
     res_init();
 #endif
     return INVALID_SOCKET;
@@ -4187,7 +4238,7 @@ inline void get_remote_ip_and_port(socket_t sock, std::string &ip, int &port) {
                    &addr_len)) {
 #ifndef _WIN32
     if (addr.ss_family == AF_UNIX) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
       struct ucred ucred;
       socklen_t len = sizeof(ucred);
       if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &ucred, &len) == 0) {
@@ -6478,7 +6529,7 @@ inline void hosted_at(const std::string &hostname,
 
   if (detail::getaddrinfo_with_timeout(hostname.c_str(), nullptr, &hints,
                                        &result, 0)) {
-#if defined __linux__ && !defined __ANDROID__
+#if (defined __linux__ || defined __EMSCRIPTEN__) && !defined __ANDROID__
     res_init();
 #endif
     return;
@@ -6769,6 +6820,20 @@ make_bearer_token_authentication_header(const std::string &token,
   auto key = is_proxy ? "Proxy-Authorization" : "Authorization";
   return std::make_pair(key, std::move(field));
 }
+
+#ifdef __EMSCRIPTEN__
+inline void
+emscripten_init_websocket(const std::string &websocket_server_bridge) {
+  detail::bridge_socket = emscripten_init_websocket_to_posix_socket_bridge(
+      websocket_server_bridge.c_str());
+  // Synchronously wait until connection has been established.
+  uint16_t ready_state = 0;
+  do {
+    emscripten_websocket_get_ready_state(detail::bridge_socket, &ready_state);
+    emscripten_thread_sleep(100);
+  } while (ready_state == 0);
+}
+#endif
 
 // Request implementation
 inline bool Request::has_header(const std::string &key) const {
@@ -7590,7 +7655,7 @@ inline bool Server::is_running() const { return is_running_; }
 
 inline void Server::wait_until_ready() const {
   while (!is_running_ && !is_decommissioned) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    detail::sleep_for(std::chrono::milliseconds{1});
   }
 }
 
@@ -8053,7 +8118,7 @@ inline bool Server::listen_internal() {
         if (errno == EMFILE) {
           // The per-process limit of open file descriptors has been reached.
           // Try to accept new connections after a short sleep.
-          std::this_thread::sleep_for(std::chrono::microseconds{1});
+          detail::sleep_for(std::chrono::microseconds{1});
           continue;
         } else if (errno == EINTR || errno == EAGAIN) {
           continue;
@@ -8629,7 +8694,7 @@ inline ClientImpl::~ClientImpl() {
       std::lock_guard<std::mutex> guard(socket_mutex_);
       if (socket_requests_in_flight_ == 0) { break; }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    detail::sleep_for(std::chrono::milliseconds{1});
   }
 
   std::lock_guard<std::mutex> guard(socket_mutex_);
@@ -10688,7 +10753,7 @@ inline ssize_t SSLSocketStream::read(char *ptr, size_t size) {
         if (SSL_pending(ssl_) > 0) {
           return SSL_read(ssl_, ptr, static_cast<int>(size));
         } else if (wait_readable()) {
-          std::this_thread::sleep_for(std::chrono::microseconds{10});
+          detail::sleep_for(std::chrono::microseconds{10});
           ret = SSL_read(ssl_, ptr, static_cast<int>(size));
           if (ret >= 0) { return ret; }
           err = SSL_get_error(ssl_, ret);
@@ -10721,7 +10786,7 @@ inline ssize_t SSLSocketStream::write(const char *ptr, size_t size) {
       while (--n >= 0 && err == SSL_ERROR_WANT_WRITE) {
 #endif
         if (wait_writable()) {
-          std::this_thread::sleep_for(std::chrono::microseconds{10});
+          detail::sleep_for(std::chrono::microseconds{10});
           ret = SSL_write(ssl_, ptr, static_cast<int>(handle_size));
           if (ret >= 0) { return ret; }
           err = SSL_get_error(ssl_, ret);
