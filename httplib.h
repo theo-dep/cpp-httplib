@@ -952,6 +952,8 @@ struct Request {
   Headers trailers;
   std::string body;
 
+  socket_t client_sock;
+
   std::string remote_addr;
   int remote_port = -1;
   std::string local_addr;
@@ -1388,7 +1390,7 @@ public:
   std::function<TaskQueue *(void)> new_task_queue;
 
 protected:
-  bool process_request(Stream &strm, const std::string &remote_addr,
+  bool process_request(Stream &strm, socket_t client_sock, const std::string &remote_addr,
                        int remote_port, const std::string &local_addr,
                        int local_port, bool close_connection,
                        bool &connection_closed,
@@ -10461,7 +10463,7 @@ get_client_ip(const std::string &x_forwarded_for,
 }
 
 inline bool
-Server::process_request(Stream &strm, const std::string &remote_addr,
+Server::process_request(Stream &strm, socket_t client_sock, const std::string &remote_addr,
                         int remote_port, const std::string &local_addr,
                         int local_port, bool close_connection,
                         bool &connection_closed,
@@ -10475,6 +10477,7 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
 
   Request req;
   req.start_time_ = std::chrono::steady_clock::now();
+  req.client_sock = client_sock;
   req.remote_addr = remote_addr;
   req.remote_port = remote_port;
   req.local_addr = local_addr;
@@ -10680,7 +10683,7 @@ inline bool Server::process_and_close_socket(socket_t sock) {
       read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
       write_timeout_usec_,
       [&](Stream &strm, bool close_connection, bool &connection_closed) {
-        return process_request(strm, remote_addr, remote_port, local_addr,
+        return process_request(strm, sock, remote_addr, remote_port, local_addr,
                                local_port, close_connection, connection_closed,
                                nullptr);
       });
@@ -14020,7 +14023,7 @@ inline bool SSLServer::process_and_close_socket(socket_t sock) {
       read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
       write_timeout_usec_,
       [&](Stream &strm, bool close_connection, bool &connection_closed) {
-        return process_request(strm, remote_addr, remote_port, local_addr,
+        return process_request(strm, sock, remote_addr, remote_port, local_addr,
                                local_port, close_connection, connection_closed,
                                [&](Request &req) { req.ssl = session; });
       });
