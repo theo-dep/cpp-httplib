@@ -330,8 +330,8 @@ using socket_t = int;
 #include <utility>
 
 #ifdef __EMSCRIPTEN__
-#include <emscripten/threading.h>
 #include <emscripten/posix_socket.h>
+#include <emscripten/threading.h>
 #include <emscripten/websocket.h>
 #endif
 
@@ -1390,10 +1390,10 @@ public:
   std::function<TaskQueue *(void)> new_task_queue;
 
 protected:
-  bool process_request(Stream &strm, socket_t client_sock, const std::string &remote_addr,
-                       int remote_port, const std::string &local_addr,
-                       int local_port, bool close_connection,
-                       bool &connection_closed,
+  bool process_request(Stream &strm, socket_t client_sock,
+                       const std::string &remote_addr, int remote_port,
+                       const std::string &local_addr, int local_port,
+                       bool close_connection, bool &connection_closed,
                        const std::function<void(Request &)> &setup_request);
 
   std::atomic<socket_t> svr_sock_{INVALID_SOCKET};
@@ -1871,6 +1871,12 @@ public:
   void set_logger(Logger logger);
   void set_error_logger(ErrorLogger error_logger);
 
+#ifdef __EMSCRIPTEN__
+  EMSCRIPTEN_RESULT connect_emscripten_websocket(int timeout = -1);
+  EMSCRIPTEN_RESULT connect_emscripten_websocket(const std::string &bridge_url,
+                                                 int timeout = -1);
+#endif
+
 protected:
   struct Socket {
     socket_t sock = INVALID_SOCKET;
@@ -1918,6 +1924,11 @@ protected:
   Socket socket_;
   mutable std::mutex socket_mutex_;
   std::recursive_mutex request_mutex_;
+
+#ifdef __EMSCRIPTEN__
+  // Emscripten bridge socket
+  EMSCRIPTEN_WEBSOCKET_T bridge_socket_ = 0;
+#endif
 
   // These are all protected under socket_mutex
   size_t socket_requests_in_flight_ = 0;
@@ -2251,6 +2262,12 @@ public:
   void set_logger(Logger logger);
   void set_error_logger(ErrorLogger error_logger);
 
+#ifdef __EMSCRIPTEN__
+  EMSCRIPTEN_RESULT connect_emscripten_websocket(int timeout = -1);
+  EMSCRIPTEN_RESULT connect_emscripten_websocket(const std::string &bridge_url,
+                                                 int timeout = -1);
+#endif
+
 private:
   std::unique_ptr<ClientImpl> cli_;
 
@@ -2464,6 +2481,40 @@ private:
 
 namespace detail {
 
+#ifdef __EMSCRIPTEN__
+class BridgeSocketRegistry {
+  BridgeSocketRegistry() = default;
+
+public:
+  static BridgeSocketRegistry &instance() {
+    static BridgeSocketRegistry instance;
+    return instance;
+  }
+
+  void insert(socket_t sock, EMSCRIPTEN_WEBSOCKET_T bridge_socket) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    registry_.insert({sock, bridge_socket});
+  }
+
+  void remove(socket_t sock) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const auto found = registry_.find(sock);
+    if (found != registry_.end()) { registry_.erase(found); }
+  }
+
+  EMSCRIPTEN_WEBSOCKET_T bridge_socket(socket_t sock) const {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const auto found = registry_.find(sock);
+    if (found == registry_.cend()) { return 0; }
+    return found->second;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::unordered_map<socket_t, EMSCRIPTEN_WEBSOCKET_T> registry_;
+};
+#endif
+
 template <typename T, typename U>
 inline void duration_to_sec_and_usec(const T &duration, U callback) {
   auto sec = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
@@ -2623,11 +2674,14 @@ make_basic_authentication_header(const std::string &username,
                                  const std::string &password,
                                  bool is_proxy = false);
 
-#ifdef __EMSCRIPTEN__
-void emscripten_init_websocket(const std::string &websocket_server_bridge);
-#endif
-
 namespace detail {
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_RESULT
+emscripten_init_websocket(EMSCRIPTEN_WEBSOCKET_T &bridge_socket,
+                          const std::string &websocket_server_bridge,
+                          int timeout);
+#endif
 
 #if defined(_WIN32)
 inline std::wstring u8string_to_wstring(const char *s) {
@@ -4569,22 +4623,29 @@ inline ssize_t send_socket(socket_t sock, const void *ptr, size_t size,
 }
 
 #ifdef __EMSCRIPTEN__
-static EMSCRIPTEN_WEBSOCKET_T bridge_socket = 0;
-inline int emscripten_poll(struct pollfd *, nfds_t, int timeout) {
-  uint64_t start_time = emscripten_get_now();
+inline int
+emscripten_bridge_socket_get_ready_state(EMSCRIPTEN_WEBSOCKET_T bridge_socket,
+                                         int timeout) {
+  const auto start_time = emscripten_get_now();
   uint16_t ready_state = 0;
   do {
     emscripten_websocket_get_ready_state(bridge_socket, &ready_state);
 
     if (timeout >= 0) {
-      uint64_t now = emscripten_get_now();
-      double elapsed_ms = (now - start_time);
+      const auto now = emscripten_get_now();
+      const auto elapsed_ms = (now - start_time);
       if (elapsed_ms >= timeout) { return 0; }
     }
 
     emscripten_thread_sleep(100);
   } while (ready_state == 0);
   return ready_state;
+}
+
+inline int emscripten_poll(struct pollfd *fds, nfds_t, int timeout) {
+  const auto bridge_socket =
+      BridgeSocketRegistry::instance().bridge_socket(fds->fd);
+  return emscripten_bridge_socket_get_ready_state(bridge_socket, timeout);
 }
 #endif
 
@@ -8359,20 +8420,6 @@ make_bearer_token_authentication_header(const std::string &token,
   return std::make_pair(key, std::move(field));
 }
 
-#ifdef __EMSCRIPTEN__
-inline void
-emscripten_init_websocket(const std::string &websocket_server_bridge) {
-  detail::bridge_socket = emscripten_init_websocket_to_posix_socket_bridge(
-      websocket_server_bridge.c_str());
-  // Synchronously wait until connection has been established.
-  uint16_t ready_state = 0;
-  do {
-    emscripten_websocket_get_ready_state(detail::bridge_socket, &ready_state);
-    emscripten_thread_sleep(100);
-  } while (ready_state == 0);
-}
-#endif
-
 // Request implementation
 inline size_t Request::get_header_value_u64(const std::string &key, size_t def,
                                             size_t id) const {
@@ -9082,6 +9129,18 @@ inline std::string prepare_host_string(const std::string &host) {
     return "[" + host + "]";
   }
 }
+
+#ifdef __EMSCRIPTEN__
+inline EMSCRIPTEN_RESULT
+emscripten_init_websocket(EMSCRIPTEN_WEBSOCKET_T &bridge_socket,
+                          const std::string &websocket_server_bridge,
+                          int timeout) {
+  bridge_socket = emscripten_init_websocket_to_posix_socket_bridge(
+      websocket_server_bridge.c_str());
+  // Synchronously wait until connection has been established.
+  return emscripten_bridge_socket_get_ready_state(bridge_socket, timeout);
+}
+#endif
 
 inline std::string make_host_and_port_string(const std::string &host, int port,
                                              bool is_ssl) {
@@ -10463,10 +10522,10 @@ get_client_ip(const std::string &x_forwarded_for,
 }
 
 inline bool
-Server::process_request(Stream &strm, socket_t client_sock, const std::string &remote_addr,
-                        int remote_port, const std::string &local_addr,
-                        int local_port, bool close_connection,
-                        bool &connection_closed,
+Server::process_request(Stream &strm, socket_t client_sock,
+                        const std::string &remote_addr, int remote_port,
+                        const std::string &local_addr, int local_port,
+                        bool close_connection, bool &connection_closed,
                         const std::function<void(Request &)> &setup_request) {
   std::array<char, 2048> buf{};
 
@@ -10746,6 +10805,13 @@ inline ClientImpl::~ClientImpl() {
   std::lock_guard<std::mutex> guard(socket_mutex_);
   shutdown_socket(socket_);
   close_socket(socket_);
+
+#ifdef __EMSCRIPTEN__
+  if (bridge_socket_ != 0) {
+    emscripten_websocket_close(bridge_socket_, 0, 0);
+    emscripten_websocket_delete(bridge_socket_);
+  }
+#endif
 }
 
 inline bool ClientImpl::is_valid() const { return true; }
@@ -10818,6 +10884,9 @@ inline bool ClientImpl::create_and_connect_socket(Socket &socket,
                                                   Error &error) {
   auto sock = create_client_socket(error);
   if (sock == INVALID_SOCKET) { return false; }
+#ifdef __EMSCRIPTEN__
+  detail::BridgeSocketRegistry::instance().insert(sock, bridge_socket_);
+#endif
   socket.sock = sock;
   return true;
 }
@@ -10855,6 +10924,9 @@ inline void ClientImpl::close_socket(Socket &socket) {
 #endif
 
   if (socket.sock == INVALID_SOCKET) { return; }
+#ifdef __EMSCRIPTEN__
+  detail::BridgeSocketRegistry::instance().remove(socket.sock);
+#endif
   detail::close_socket(socket.sock);
   socket.sock = INVALID_SOCKET;
 }
@@ -13201,6 +13273,20 @@ inline void ClientImpl::set_error_logger(ErrorLogger error_logger) {
   error_logger_ = std::move(error_logger);
 }
 
+#ifdef __EMSCRIPTEN__
+inline EMSCRIPTEN_RESULT ClientImpl::connect_emscripten_websocket(int timeout) {
+  const auto path = detail::make_host_and_port_string_always_port(host_, port_);
+  const std::string scheme = is_ssl() ? "https" : "http";
+  return connect_emscripten_websocket(scheme + "://" + path + "/ws", timeout);
+}
+
+inline EMSCRIPTEN_RESULT
+ClientImpl::connect_emscripten_websocket(const std::string &bridge_url,
+                                         int timeout) {
+  return detail::emscripten_init_websocket(bridge_socket_, bridge_url, timeout);
+}
+#endif
+
 /*
  * SSL/TLS Common Implementation
  */
@@ -13883,6 +13969,18 @@ inline void Client::set_logger(Logger logger) {
 inline void Client::set_error_logger(ErrorLogger error_logger) {
   cli_->set_error_logger(std::move(error_logger));
 }
+
+#ifdef __EMSCRIPTEN__
+inline EMSCRIPTEN_RESULT Client::connect_emscripten_websocket(int timeout) {
+  return cli_->connect_emscripten_websocket(timeout);
+}
+
+inline EMSCRIPTEN_RESULT
+Client::connect_emscripten_websocket(const std::string &bridge_url,
+                                     int timeout) {
+  return cli_->connect_emscripten_websocket(bridge_url, timeout);
+}
+#endif
 
 /*
  * Group 6: SSL Server and Client implementation
